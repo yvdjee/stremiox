@@ -153,7 +153,9 @@ struct iOSDetailView: View {
                 }
             }
         }
-        .onDisappear { core.unloadMeta(); torrentPrime?.cancel() }
+        // An episode push also hides this page. Keep the shared engine state for the
+        // destination's stream request; the next title load replaces the cached details.
+        .onDisappear { torrentPrime?.cancel() }
         // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
         .task {
             try? await Task.sleep(for: .seconds(12))
