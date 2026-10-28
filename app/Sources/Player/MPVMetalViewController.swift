@@ -126,15 +126,37 @@ final class MPVMetalViewController: PlatformViewController {
         // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
         // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
         // the video output (vid no → auto) at the new size.
-        if didResize { reconfigureVideoOutput() }
+        if didResize { scheduleVideoReconfigure() }
+    }
+
+    /// The rebuild waiting for a resize to settle. A live window resize or a macOS full-screen
+    /// transition lays the view out dozens of times; rebuilding on every pass restarted the video
+    /// chain (decoder re-init plus a refresh seek on the stream) each time. Rebuild once instead.
+    private var pendingVideoReconfigure: DispatchWorkItem?
+
+    private func scheduleVideoReconfigure() {
+        pendingVideoReconfigure?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.pendingVideoReconfigure = nil
+            self?.reconfigureVideoOutput()
+        }
+        pendingVideoReconfigure = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     private func reconfigureVideoOutput() {
         guard mpv != nil else { return }
+        // force-window keeps the video output alive across `vid=no`: mpv then reconfigures it in
+        // place, which is the one path where MPVKit's moltenvk context re-reads the layer's
+        // drawableSize. Without it `vid=no` destroyed the output, and freeing the Vulkan device
+        // while Metal command buffers were still completing crashed the app entering full screen
+        // (SIGSEGV in MVKCommandEncoder::finishQueries on com.Metal.CompletionQueueDispatch).
+        checkError(mpv_set_option_string(mpv, "force-window", "yes"))
         checkError(mpv_set_option_string(mpv, "vid", "no"))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil else { return }
             self.checkError(mpv_set_option_string(self.mpv, "vid", "auto"))
+            self.checkError(mpv_set_option_string(self.mpv, "force-window", "no"))
             self.applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
         }
     }
@@ -183,7 +205,7 @@ final class MPVMetalViewController: PlatformViewController {
     private var outputSampleRate: Double = 0
 
     private func configureAudioSession() {
-        // AVAudioSession is iOS/tvOS only; on macOS mpv's coreaudio AO owns audio routing, so this
+        // AVAudioSession is iOS/tvOS only; on macOS mpv's avfoundation AO owns audio routing, so this
         // is a no-op there.
         #if canImport(UIKit)
         do {
@@ -330,8 +352,8 @@ final class MPVMetalViewController: PlatformViewController {
         // can override the whole policy with the Audio Output setting (Auto / Stereo / Surround).
         // Audio output policy is iOS/tvOS only: mpv there uses the low-level audiounit AO that does
         // not resample or downmix to the route on its own, so we drive it (the soundbar fixes). On
-        // macOS mpv uses the coreaudio AO, which negotiates rate, channels, and routing natively
-        // like desktop mpv, so we leave audio at mpv's defaults.
+        // macOS the avfoundation AO negotiates rate, channels, and routing natively, so we leave
+        // the rest of audio at mpv's defaults.
         #if canImport(UIKit)
         checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
         // Never let an AO-open failure fall through to the null AO: that is silent death with no
@@ -345,6 +367,18 @@ final class MPVMetalViewController: PlatformViewController {
         }
         appliedAudioPolicy = (channelPolicy, sampleRatePolicy ?? 0)   // baseline so reapply only fires on a real change
         mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
+        #else
+        // Pin the avfoundation AO and never let mpv try coreaudio (its default first pick on macOS).
+        // In libmpv 0.41.0 ao_coreaudio registers a CoreAudio device listener with the AO as its
+        // context BEFORE opening the AudioUnit; when that open fails (macOS 27 rejects some channel
+        // maps with -50, seen live) mpv frees the AO without removing the listener and falls back to
+        // avfoundation. The next device change (Bluetooth headphones connecting) then calls into the
+        // freed AO: SIGSEGV in hotplug_cb -> mp_msg on the HALC_ProxyNotification queue, killing the
+        // app mid-playback. Fixed upstream (mpv af067b5e + c5d391ad, mpv-player/mpv#18274) but not
+        // in any MPVKit release yet. avfoundation is what mpv ended up on anyway, it follows the
+        // system output device by itself, and it installs no HAL listeners. Revisit once MPVKit
+        // ships an mpv with the fix.
+        checkError(mpv_set_option_string(mpv, "ao", "avfoundation"))
         #endif
 
         checkError(mpv_initialize(mpv))
@@ -370,7 +404,7 @@ final class MPVMetalViewController: PlatformViewController {
     
     public func setupNotification() {
         // App-lifecycle + audio-route observers are iOS/tvOS only (UIApplication notifications and
-        // AVAudioSession both exist there). On macOS mpv's coreaudio AO handles routing and the app
+        // AVAudioSession both exist there). On macOS mpv's avfoundation AO handles routing and the app
         // is a window, so there is nothing to observe here.
         #if canImport(UIKit)
         NotificationCenter.default.addObserver(self, selector: #selector(enterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
@@ -445,6 +479,8 @@ final class MPVMetalViewController: PlatformViewController {
         HDRDisplayMode.reset(in: viewIfLoaded?.window)
 #endif
         appliedDynamicRange = .sdr
+        pendingVideoReconfigure?.cancel()
+        pendingVideoReconfigure = nil
         guard let handle = mpv else { return }
         // Nil the handle SYNCHRONOUSLY so exactly one owner destroys it: deinit's safety net
         // sees nil (no double terminate when dealloc beats the queued block), the event drain
@@ -647,6 +683,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     private func getFlag(_ name: String) -> Bool {
+        guard mpv != nil else { return false }
         var data = Int64()
         mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
         return data > 0

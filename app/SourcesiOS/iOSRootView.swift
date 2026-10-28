@@ -236,7 +236,7 @@ struct iOSHomeView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
-            .iOSPlayerCover($player, account: account)
+            .iOSPlayerCover($player)
         }
         // Reseed the pool as content arrives; the model ignores no-op reseeds so rotation isn't reset
         // by routine engine re-emits.
@@ -468,7 +468,7 @@ struct iOSSearchView: View {
             }
             // Present the paste-a-link player HERE (the Search tab is not a sheet) so the macOS root player
             // fills the window cleanly. On iOS this is a fullScreenCover; on macOS it hoists to MacPlayerHost.
-            .iOSPlayerCover($pastedPlayer, account: account)
+            .iOSPlayerCover($pastedPlayer)
         }
     }
 
@@ -712,28 +712,18 @@ struct iOSPlayerLaunch: Identifiable {
     /// direct-resume; nil for paste-a-link (which has no `meta`, so nothing is recorded anyway).
     var qualityText: String? = nil
     var isTorrent: Bool = false
+    /// The launching stream's `behaviorHints.bingeGroup`, so the next episode prefers the same release.
+    var bingeGroup: String? = nil
 }
 
 extension View {
-    /// Present `PlayerScreen` for an `iOSPlayerLaunch` over the browse screen, saving progress to
-    /// the account (the same wiring `iOSDetailView` uses) when the launch carries a `PlaybackMeta`.
-    @ViewBuilder func iOSPlayerCover(_ launch: Binding<iOSPlayerLaunch?>,
-                                     account: StremioAccount) -> some View {
+    /// Present the player for an `iOSPlayerLaunch` over the browse screen. `iOSEpisodePlayer` saves
+    /// progress to the account when the launch carries a `PlaybackMeta`, and for a series episode
+    /// carries on into the next one (Up Next card, Next button, or the episode ending).
+    @ViewBuilder func iOSPlayerCover(_ launch: Binding<iOSPlayerLaunch?>) -> some View {
         platformFullScreenPlayerCover(item: launch) { item in
-            PlayerScreen(
-                url: item.url, title: item.title, headers: item.headers, resumeSeconds: item.resume,
-                recordMeta: item.meta, recordQualityText: item.qualityText, recordIsTorrent: item.isTorrent,
-                onProgress: { pos, dur in
-                    guard let meta = item.meta else { return }
-                    Task { [weak account] in await account?.saveProgress(for: meta, positionSeconds: pos, durationSeconds: dur) }
-                },
-                onSeek: { pos, dur in
-                    guard let meta = item.meta else { return }
-                    Task { [weak account] in await account?.saveProgress(for: meta, positionSeconds: pos, durationSeconds: dur) }
-                },
-                onClose: { launch.wrappedValue = nil }
-            )
-            .ignoresSafeArea()
+            iOSEpisodePlayer(launch: item, onClose: { launch.wrappedValue = nil })
+                .ignoresSafeArea()
         }
     }
 }

@@ -121,6 +121,10 @@ struct MacRootPlayerOverlay: ViewModifier {
             content
                 .opacity(host.content == nil ? 1 : 0)
                 .disabled(host.content != nil)
+                // Hide the window toolbar through SwiftUI too: it re-shows the NSToolbar on its own
+                // updates, so with only MacPlayerChromeHider the nav back button, page title and the
+                // Search tab's search field still floated over the player's top controls.
+                .toolbar(host.content == nil ? .automatic : .hidden, for: .windowToolbar)
             if let player = host.content {
                 player
                     .ignoresSafeArea()
@@ -135,6 +139,8 @@ struct MacRootPlayerOverlay: ViewModifier {
 /// Deliberately does NOT touch `styleMask` / `.fullSizeContentView`: reassigning the styleMask on restore
 /// collapsed the window to its minimum size (observed on-device). Only title + toolbar visibility are
 /// toggled, which leaves a thin traffic-light strip at top but never resizes the window.
+/// Entering or leaving full screen re-shows the toolbar (and SwiftUI may swap in a new NSToolbar), which
+/// put the Search field and the episode title back over the video, so the hide is re-applied then too.
 private struct MacPlayerChromeHider: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
@@ -149,9 +155,8 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
             c.savedTitleVisibility = host.titleVisibility
             c.savedTitlebarTransparent = host.titlebarAppearsTransparent
             c.savedToolbarVisible = host.toolbar?.isVisible
-            host.titleVisibility = .hidden
-            host.titlebarAppearsTransparent = true
-            host.toolbar?.isVisible = false
+            c.hide()
+            c.watch(host)
         }
         return view
     }
@@ -160,6 +165,7 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.cancelled = true   // stops a not-yet-run makeNSView async block from hiding the titlebar
+        coordinator.unwatch()
         guard let host = coordinator.host else { return }
         host.titleVisibility = coordinator.savedTitleVisibility
         host.titlebarAppearsTransparent = coordinator.savedTitlebarTransparent
@@ -174,6 +180,36 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         var savedTitleVisibility: NSWindow.TitleVisibility = .visible
         var savedTitlebarTransparent = false
         var savedToolbarVisible: Bool?
+        private var observers: [NSObjectProtocol] = []
+        private var toolbarObservation: NSKeyValueObservation?
+
+        func hide() {
+            guard !cancelled, let host else { return }
+            host.titleVisibility = .hidden
+            host.titlebarAppearsTransparent = true
+            host.toolbar?.isVisible = false
+        }
+
+        /// Re-hide after every full-screen transition and whenever the window gets a new toolbar. Each
+        /// re-hide waits a runloop turn so it lands after AppKit / SwiftUI finished showing it.
+        func watch(_ window: NSWindow) {
+            let names: [Notification.Name] = [NSWindow.willEnterFullScreenNotification, NSWindow.didEnterFullScreenNotification,
+                                              NSWindow.willExitFullScreenNotification, NSWindow.didExitFullScreenNotification]
+            observers = names.map { name in
+                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    DispatchQueue.main.async { self?.hide() }
+                }
+            }
+            toolbarObservation = window.observe(\.toolbar) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.hide() }
+            }
+        }
+
+        func unwatch() {
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            toolbarObservation = nil
+        }
     }
 }
 #endif

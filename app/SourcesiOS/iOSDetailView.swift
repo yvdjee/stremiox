@@ -7,7 +7,7 @@ import SwiftUI
 /// share one implementation. Returns the retry Task (or nil for a non-torrent / disabled prime) so the
 /// caller can store and cancel it — the backoff loop outlives the view otherwise, leaking on every pick.
 @discardableResult
-private func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
+func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
     guard !PlaybackSettings.torrentsDisabled else { return nil }
     guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
           let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return nil }
@@ -153,7 +153,9 @@ struct iOSDetailView: View {
                 }
             }
         }
-        .onDisappear { core.unloadMeta(); torrentPrime?.cancel() }
+        // An episode push also hides this page. Keep the shared engine state for the
+        // destination's stream request; the next title load replaces the cached details.
+        .onDisappear { torrentPrime?.cancel() }
         // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
         .task {
             try? await Task.sleep(for: .seconds(12))
@@ -892,7 +894,7 @@ struct iOSEpisodeStreams: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
 
-    @State private var player: iOSDetailView.PlayerLaunch?
+    @State private var player: iOSPlayerLaunch?
     @State private var preparing = false
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
@@ -927,31 +929,27 @@ struct iOSEpisodeStreams: View {
         .inlineNavigationTitle()
         // The engine loads per-episode streams on demand; trigger that load for THIS episode — but only
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
-        .onAppear {
-            // Load THIS episode's streams. The series meta is often ALREADY loaded (from the detail page)
-            // WITHOUT this episode's stream path, so guarding on meta id alone skipped the stream request
-            // entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
-            // Also (re)load whenever the loaded streams aren't this episode's; the engine de-dups an
-            // identical meta+stream load, so this is cheap when the right streams are already present.
-            let hasThisEpisodeStreams = core.metaDetails?.streams.contains { $0.request.path.id == video.id } ?? false
-            if core.metaDetails?.meta?.id != meta.id || !hasThisEpisodeStreams {
-                core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id)
-            }
-        }
+        .onAppear { loadEpisodeStreams() }
+        // Playing on into later episodes points the engine at THEIR streams; back on this page,
+        // load this episode's again so its source list isn't left empty.
+        .onChange(of: player == nil) { closed in if closed { loadEpisodeStreams() } }
         .onDisappear { torrentPrime?.cancel() }
         .task {
             try? await Task.sleep(for: .seconds(12))
             settleTimedOut = true
         }
-        .platformFullScreenPlayerCover(item: $player) { launch in
-            PlayerScreen(
-                url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
-                recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
-                onProgress: { pos, dur in Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                onSeek: { pos, dur in Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                onClose: { player = nil }
-            )
-            .ignoresSafeArea()
+        .iOSPlayerCover($player)
+    }
+
+    /// Load THIS episode's streams. The series meta is often ALREADY loaded (from the detail page)
+    /// WITHOUT this episode's stream path, so guarding on meta id alone skipped the stream request
+    /// entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
+    /// Also (re)load whenever the loaded streams aren't this episode's; the engine de-dups an
+    /// identical meta+stream load, so this is cheap when the right streams are already present.
+    private func loadEpisodeStreams() {
+        let hasThisEpisodeStreams = core.metaDetails?.streams.contains { $0.request.path.id == video.id } ?? false
+        if core.metaDetails?.meta?.id != meta.id || !hasThisEpisodeStreams {
+            core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id)
         }
     }
 
@@ -1047,9 +1045,10 @@ struct iOSEpisodeStreams: View {
         let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
                               name: meta.name, poster: video.thumbnail ?? meta.poster,
                               season: video.season, episode: video.episode)
-        player = iOSDetailView.PlayerLaunch(url: url, title: name, headers: stream.requestHeaders,
-                                            resume: await resume(pm), meta: pm,
-                                            qualityText: StreamRanking.signature(stream), isTorrent: stream.isTorrent)
+        player = iOSPlayerLaunch(url: url, title: name, headers: stream.requestHeaders,
+                                 resume: await resume(pm), meta: pm,
+                                 qualityText: StreamRanking.signature(stream), isTorrent: stream.isTorrent,
+                                 bingeGroup: stream.behaviorHints?.bingeGroup)
     }
 
     private func resume(_ pm: PlaybackMeta) async -> Double {
@@ -1401,6 +1400,14 @@ private struct iOSStreamLabel: View {
                             .font(Theme.Typography.label)
                             .foregroundStyle(Theme.Palette.textTertiary)
                             .lineLimit(1)
+                    }
+                    // Seeders only where they decide the start time (raw torrent / uncached debrid).
+                    if let seeders = StreamRanking.displaySeeders(stream) {
+                        Label("\(seeders)", systemImage: "person.fill")
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(seeders == 0 ? Theme.Palette.textTertiary : Theme.Palette.textSecondary)
+                            .lineLimit(1)
+                            .accessibilityLabel("\(seeders) seeder\(seeders == 1 ? "" : "s")")
                     }
                 }
                 // One trimmed human-readable line for context (the release title), collapsed to a

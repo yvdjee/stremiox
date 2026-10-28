@@ -15,6 +15,8 @@ struct PlayerScreen: View {
     var headers: [String: String]? = nil                    // behaviorHints.proxyHeaders for header-gated CDNs
     var resumeSeconds: Double = 0                            // saved position to resume from
     var hasNext: Bool = false                               // show the Next Episode button
+    var nextLabel: String? = nil                            // "S1 · E5 · Title" for the Up Next card
+    var nextThumbnail: URL? = nil                           // the next episode's still, shown on the card
     // Continue-Watching / quality-continuity parity with tvOS: when set, the working link is recorded
     // into LastStreamStore once playback actually starts, so a later CW tap can resume this exact
     // stream and reopening the title auto-picks the same quality. nil for ad-hoc plays (paste-a-link),
@@ -92,6 +94,7 @@ struct PlayerScreen: View {
     @State private var appliedSize = false
     @State private var appliedInitialResume = false   // the launch-offset seek runs once; switches use nudgeResume
     @State private var markedWatched = false           // ~90%/EOF watched marker fires once per title (mirrors tvOS)
+    @State private var upNextDismissed = false         // the user closed the Up Next card for this episode
     @State private var buffering = true
     @State private var currentTime = 0.0
     @State private var duration = 0.0
@@ -113,6 +116,12 @@ struct PlayerScreen: View {
     /// Display-sleep assertion held while the player is open (macOS parity with the iOS idle-timer
     /// disable): keeps the Mac from dimming / sleeping mid-movie. Ended on disappear.
     @State private var macSleepActivity: NSObjectProtocol?
+    /// Local keyDown monitor that turns Esc / ⌘. into "close the player" (see handleMacKeyDown).
+    @State private var macKeyMonitor: Any?
+    /// Whether the app window is in full screen, for the top-bar button's icon and the titlebar
+    /// inset. Follows the window notifications, so the green button and the View menu keep it right too.
+    @State private var macFullScreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
+    @State private var lastHoverWake = Date.distantPast   // throttles the mouse-move wake of the controls
     #endif
     @State private var panel: Panel?
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
@@ -191,19 +200,29 @@ struct PlayerScreen: View {
             // a SwiftUI contentShape layer catches every tap. The controls sit above it, so their
             // buttons still work and a tap on empty space falls through here to toggle.
             Color.clear.contentShape(Rectangle()).onTapGesture { toggleControls() }.ignoresSafeArea()
+                #if os(macOS)
+                // Double-click toggles full screen, as in other Mac video players. Simultaneous so a
+                // single click still shows/hides the controls without waiting out the double-click
+                // interval (a double click toggles them twice, leaving them as they were).
+                .simultaneousGesture(TapGesture(count: 2).onEnded { toggleMacFullScreen() })
+                #endif
                 .accessibilityLabel("Show player controls")
                 .accessibilityAction { toggleControls() }
 
             if (buffering || reconnecting) && !loadFailed { bufferingOverlay }
 
-            // Skip pill shows only while watching (controls hidden), mirroring tvOS.
-            if let seg = currentSkip, !controlsVisible, panel == nil, !loadFailed { skipPill(seg) }
+            // Skip pill shows only while watching (controls hidden), mirroring tvOS. Over the end
+            // credits the Up Next card takes its place: skipping the credits means the next episode.
+            if let seg = currentSkip, !controlsVisible, panel == nil, !loadFailed,
+               !(showUpNext && seg.kind == .credits) { skipPill(seg) }
 
             // Render controls UNCONDITIONALLY (just faded/non-interactive when hidden) so VoiceOver can
             // still reach them when auto-hidden — otherwise a hidden bar drops out of the a11y tree (#31).
             if !loadFailed {
                 controls.opacity(controlsVisible ? 1 : 0).allowsHitTesting(controlsVisible)
             }
+
+            if showUpNext { upNextCard }
 
             if let panel { selectionSheet(panel) }
 
@@ -222,31 +241,56 @@ struct PlayerScreen: View {
                                 .padding(12).background(.black.opacity(0.55), in: Circle())
                         }
                         .buttonStyle(.plain)
-                        .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
+                        .keyboardShortcut(.cancelAction)   // ⌘. / Esc on iPad; the Mac uses handleMacKeyDown
                         .accessibilityLabel("Close player")
                         Spacer()
                     }
                     Spacer()
                 }
-                .padding(.horizontal).padding(.top, 12)
+                .padding(.horizontal).padding(.top, 12 + titlebarInset)
                 .transition(.opacity)
                 .zIndex(100)
             }
 
             #if os(macOS)
-            // The visible pre-start close button vanishes once playback starts, taking its
-            // .cancelAction shortcut with it. macOS has no remote/Esc fallback otherwise, so keep an
-            // always-present hidden Esc handler so ⌘. / Esc closes the player at any point (#14).
-            Button { leavePlayback() } label: { EmptyView() }
-                .keyboardShortcut(.cancelAction)
+            // Space toggles play/pause, like every Mac video player. A hidden button because the
+            // visible one fades out and stops taking input when the controls auto-hide.
+            Button { togglePlayback() } label: { EmptyView() }
+                .keyboardShortcut(.space, modifiers: [])
+                .hidden()
+            // ⌘F toggles the app window's full screen (the player already fills the window). Scoped to
+            // the player so ⌘F stays free for search elsewhere in the app.
+            Button { toggleMacFullScreen() } label: { EmptyView() }
+                .keyboardShortcut("f", modifiers: .command)
                 .hidden()
             #endif
+
+            // ← / → seek 10 s on a Mac or iPad keyboard, like the on-screen skip buttons. Off for live
+            // (no timeline) and while a panel is open, so the keys still move through its list.
+            if !isLive, hasStartedPlaying, panel == nil {
+                Group {
+                    Button { seek(by: -10) } label: { EmptyView() }.keyboardShortcut(.leftArrow, modifiers: [])
+                    Button { seek(by: 10) } label: { EmptyView() }.keyboardShortcut(.rightArrow, modifiers: [])
+                }
+                .hidden()
+            }
         }
         #if os(iOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         #endif
         .tint(Theme.Palette.accent)
+        .animation(.easeInOut(duration: 0.25), value: showUpNext)
+        #if os(macOS)
+        // Moving the mouse brings the controls up (and keeps them up while it moves), as in other Mac
+        // players, instead of needing a click. A move fires many times a second, so re-arm the hide
+        // timer at most twice a second.
+        .onContinuousHover { phase in
+            guard case .active = phase, panel == nil, Date().timeIntervalSince(lastHoverWake) > 0.5 else { return }
+            lastHoverWake = Date()
+            withAnimation(.easeInOut(duration: 0.2)) { scheduleHide() }
+        }
+        #endif
         .onAppear {
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
             scheduleHide(); startLoadTimeout()
@@ -257,6 +301,12 @@ struct PlayerScreen: View {
             // mid-movie (the iOS/tvOS keep-awake parity that was missing on Mac).
             macSleepActivity = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled,
                                                                      reason: "StremioX video playback")
+            if macKeyMonitor == nil {
+                macKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    MainActor.assumeIsolated { handleMacKeyDown(event) } ? nil : event
+                }
+            }
+            macFullScreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
             #endif
         }
         .onDisappear {
@@ -267,6 +317,7 @@ struct PlayerScreen: View {
             UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
+            if let monitor = macKeyMonitor { NSEvent.removeMonitor(monitor); macKeyMonitor = nil }
             #endif
         }
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
@@ -292,6 +343,14 @@ struct PlayerScreen: View {
             Text(externalChooserMessage)
         }
         .sheet(isPresented: $showShare) { ShareSheet(items: [curURL ?? url]) }
+        #if os(macOS)
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            macFullScreen = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            macFullScreen = false
+        }
+        #endif
     }
 
     // MARK: - Property handling
@@ -823,6 +882,12 @@ struct PlayerScreen: View {
                 coordinator.player?.setOrientation(landscape: forcedLandscape)
                 scheduleHide()
             }
+            #elseif os(macOS)
+            iconButton(macFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                       label: macFullScreen ? "Exit full screen" : "Enter full screen") {
+                toggleMacFullScreen()
+                scheduleHide()
+            }
             #endif
             if !isLive {
                 // Restart from 0:00 (tvOS parity #5): seek to the start and keep playing.
@@ -840,7 +905,17 @@ struct PlayerScreen: View {
                 showExternalChooser = true
             }
         }
-        .padding(.horizontal).padding(.top, 8)
+        .padding(.horizontal).padding(.top, 8 + titlebarInset)
+    }
+
+    /// The Mac player fills the window under its transparent titlebar, whose traffic lights would sit
+    /// on the top-left buttons; start the top controls below them. Full screen has no traffic lights.
+    private var titlebarInset: CGFloat {
+        #if os(macOS)
+        return macFullScreen ? 0 : 28
+        #else
+        return 0
+        #endif
     }
 
     private var centerTransport: some View {
@@ -849,7 +924,7 @@ struct PlayerScreen: View {
             if !isLive {
                 seekButton("gobackward.10", by: -10)
             }
-            Button { coordinator.player?.togglePause(); scheduleHide() } label: {
+            Button { togglePlayback() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
                     .frame(width: 100, height: 100)
@@ -861,18 +936,30 @@ struct PlayerScreen: View {
         }
     }
 
+    /// Play/pause from the center button or the space bar. Brings the controls up so the new state
+    /// shows; they stay up while paused. Nothing to toggle behind the load-error overlay.
+    private func togglePlayback() {
+        guard !loadFailed else { return }
+        coordinator.player?.togglePause()
+        scheduleHide()
+    }
+
     private func seekButton(_ icon: String, by delta: Double) -> some View {
-        Button {
-            let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
-            coordinator.player?.seek(to: target)
-            currentTime = target
-            if duration > 0 { onSeek(target, duration); lastReported = target }
-            scheduleHide()
-        } label: {
+        Button { seek(by: delta) } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.white).shadow(radius: 4).frame(width: 60, height: 60)
         }
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
+    }
+
+    /// Jump `delta` seconds, clamped to the file, and record the new position. Shows the controls so
+    /// the scrubber confirms where it landed (the ±10 s buttons and the arrow keys share this).
+    private func seek(by delta: Double) {
+        let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
+        coordinator.player?.seek(to: target)
+        currentTime = target
+        if duration > 0 { onSeek(target, duration); lastReported = target }
+        withAnimation(.easeInOut(duration: 0.2)) { scheduleHide() }
     }
 
     private var bottomBar: some View {
@@ -957,6 +1044,93 @@ struct PlayerScreen: View {
                 .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
         }
         .accessibilityLabel(label)
+    }
+
+    // MARK: - Up Next
+
+    /// Whether the Up Next card is up: a next episode exists and this one is in its end credits (a
+    /// detected credits span in the last part of the file) or, without one, its last 30 seconds.
+    private var showUpNext: Bool {
+        guard hasNext, !isLive, hasStartedPlaying, !loadFailed, !upNextDismissed, panel == nil,
+              duration > 120 else { return false }
+        let inCredits = skipSegments.contains { $0.kind == .credits && $0.start >= duration * 0.7 && currentTime >= $0.start }
+        return inCredits || duration - currentTime <= 30
+    }
+
+    /// Bottom-right card offering the next episode in one click. The episode still advances by
+    /// itself when this one ends, so the card counts down the final minute.
+    private var upNextCard: some View {
+        let remaining = max(0, duration - currentTime)
+        return VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .top, spacing: 12) {
+                        if let nextThumbnail {
+                            AsyncImage(url: nextThumbnail) { phase in
+                                switch phase {
+                                case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+                                default: Color.white.opacity(0.08)
+                                }
+                            }
+                            .frame(width: 112, height: 63)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .accessibilityHidden(true)
+                        }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("UP NEXT").font(.caption2.weight(.bold)).tracking(1.2)
+                                .foregroundStyle(Theme.Palette.accent)
+                            if let nextLabel {
+                                Text(nextLabel).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                            }
+                            if remaining <= 60 {
+                                Text("Starts in \(Int(remaining.rounded(.up)))s")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.7))
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        Button { withAnimation(.easeInOut(duration: 0.2)) { upNextDismissed = true } } label: {
+                            Image(systemName: "xmark").font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.8)).padding(8)
+                                .background(.white.opacity(0.12), in: Circle())
+                                .frame(width: 44, height: 44).contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, -10).padding(.trailing, -10)
+                        .accessibilityLabel("Hide Up Next")
+                    }
+                    Button { playNextNow() } label: {
+                        Label("Play next episode", systemImage: "play.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .foregroundStyle(Theme.Palette.onAccent)
+                            .background(Capsule().fill(Theme.Palette.accent))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.defaultAction)   // Return plays it on a Mac / iPad keyboard
+                }
+                .padding(14)
+                .frame(width: 320)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.black.opacity(0.78)))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(.white.opacity(0.1)))
+                // Sit above the scrubber + control row while the controls are up.
+                .padding(.trailing, 24).padding(.bottom, controlsVisible ? 130 : 36)
+            }
+        }
+        .transition(.move(edge: .trailing).combined(with: .opacity))
+        .animation(.easeInOut(duration: 0.2), value: controlsVisible)
+    }
+
+    /// Leave this episode for the next one: flush progress and count it as watched (choosing Up Next
+    /// over the credits finishes the episode), then hand over to the presenter.
+    private func playNextNow() {
+        if !isLive, duration > 0 { onProgress(currentTime, duration) }
+        if !markedWatched, !isLive, let m = recordMeta { markedWatched = true; core.markPlaybackWatched(m) }
+        onNext()
     }
 
     // MARK: - Skip intro / outro
@@ -1302,6 +1476,33 @@ struct PlayerScreen: View {
         onClose()
     }
 
+    #if os(macOS)
+    /// Esc / ⌘. step back, returning true when the key was handled: in full screen they bring the
+    /// window back to the windowed player, otherwise they close the player (#14). An AppKit monitor
+    /// rather than a hidden `.cancelAction` button: once the window has been in and out of full
+    /// screen that shortcut stops firing (the Esc keyDown still reaches the window, with the window
+    /// as first responder, but no action runs). A sheet on the window ("Play in another app", the
+    /// share sheet) keeps Esc for itself.
+    private func handleMacKeyDown(_ event: NSEvent) -> Bool {
+        guard let window = event.window, !window.isSheet, window.attachedSheet == nil else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let escape = event.keyCode == 53 && modifiers.isEmpty   // 53 = kVK_Escape
+        let commandPeriod = event.charactersIgnoringModifiers == "." && modifiers == .command
+        guard escape || commandPeriod else { return false }
+        if window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+        } else {
+            leavePlayback()
+        }
+        return true
+    }
+
+    /// Full screen for the app window (the player already fills it): the top-bar button and ⌘F.
+    private func toggleMacFullScreen() {
+        NSApp.keyWindow?.toggleFullScreen(nil)
+    }
+    #endif
+
     private func refreshTracks() {
         audioTracks = coordinator.player?.tracks(ofType: "audio") ?? []
         subtitleTracks = coordinator.player?.tracks(ofType: "sub") ?? []
@@ -1345,6 +1546,9 @@ struct PlayerScreen: View {
             // while scrubbing, a panel is open, or paused.
             guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused else { return }
             withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
+            #if os(macOS)
+            NSCursor.setHiddenUntilMouseMoves(true)   // the pointer goes with the controls; a move brings both back
+            #endif
         }
     }
 

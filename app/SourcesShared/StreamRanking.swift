@@ -91,8 +91,14 @@ enum StreamRanking {
         }
         let hasHint = hint?.isEmpty == false
         let hasBinge = binge?.isEmpty == false
-        guard hasHint || hasBinge else { return best(groups) }
-        let candidates = groups.flatMap { $0.streams }.filter { $0.playableURL != nil }
+        guard hasHint || hasBinge, let plain = best(groups) else { return best(groups) }
+        // The bonuses pick a release family among sources at least as sharp as the plain best,
+        // never a lower resolution: a 1080p only out-scores a 720p by ~360, so the +800 / +2500
+        // otherwise kept a whole season on 720p once its first episode played at 720p, even with
+        // a cached 1080p (or 4K) available.
+        let floor = resolution(qualityText(plain))
+        let candidates = groups.flatMap { $0.streams }
+            .filter { $0.playableURL != nil && resolution(qualityText($0)) >= floor }
         return candidates.max { lhs, rhs in
             (score(lhs) + continuityBonus(lhs, hint: hint) + bingeBonus(lhs, group: binge)) <
             (score(rhs) + continuityBonus(rhs, hint: hint) + bingeBonus(rhs, group: binge))
@@ -328,6 +334,15 @@ enum StreamRanking {
     /// (e.g. "👤 47" or "Seeders: 47"). The emoji form wins over the worded form, and the
     /// worded form requires its colon, so a title like "The Bad Seed 2018" can't supply a
     /// phantom count. nil when absent.
+    /// Seeders worth showing on a source row: only where swarm health decides how fast playback
+    /// starts, a raw torrent or an uncached debrid result. A cached / direct stream plays at once
+    /// whatever the swarm, so it gets nil.
+    static func displaySeeders(_ s: CoreStream) -> Int? {
+        let text = qualityText(s)
+        guard s.isTorrent || !isCached(s, text) else { return nil }
+        return seederCount(text)
+    }
+
     static func seederCount(_ text: String) -> Int? {
         let patterns = [#"👤[:\s]*([0-9]+)"#, #"(?<![a-z0-9])seed(er)?s?\s*:\s*([0-9]+)"#]
         for pattern in patterns {

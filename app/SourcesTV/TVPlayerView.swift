@@ -1608,18 +1608,7 @@ struct TVPlayerView: View {
         let sources = account.streamSources
         plog.info("preloading next episode \(next.id, privacy: .public) from \(sources.count, privacy: .public) add-ons")
         Task {
-            var groups: [CoreStreamSourceGroup] = []
-            await withTaskGroup(of: CoreStreamSourceGroup?.self) { tasks in
-                for source in sources {
-                    tasks.addTask { await Self.fetchStreams(base: source.base, addon: source.name, id: next.id) }
-                }
-                for await group in tasks { if let group { groups.append(group) } }
-            }
-            // Keep the user's add-on priority order for ranking ties. Bases can REPEAT in the
-            // add-on list, so this must unique (uniqueKeysWithValues: traps on duplicates).
-            let order = Dictionary(sources.enumerated().map { ($1.base, $0) },
-                                   uniquingKeysWith: { first, _ in first })
-            groups.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
+            let groups = await NextEpisodeStreams.fetch(episodeId: next.id, from: sources)
             let withBinge = groups.flatMap { $0.streams }.filter { ($0.behaviorHints?.bingeGroup?.isEmpty == false) }.count
             DiagnosticsLog.log("binge", "preload next ep: want binge=\(curBinge ?? "nil"), \(withBinge) of \(groups.flatMap { $0.streams }.count) streams carry a bingeGroup")
             if let best = StreamRanking.best(groups, continuity: curHint, binge: curBinge) {
@@ -1631,19 +1620,6 @@ struct TVPlayerView: View {
             }
             preloadingID = nil
         }
-    }
-
-    /// One add-on's streams for an episode, straight over the Stremio addon protocol.
-    private static func fetchStreams(base: String, addon: String, id: String) async -> CoreStreamSourceGroup? {
-        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
-        guard let url = URL(string: "\(base)/stream/series/\(escaped).json") else { return nil }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 25
-        struct Response: Decodable { let streams: [CoreStream]? }
-        guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let response = try? JSONDecoder().decode(Response.self, from: data),
-              let streams = response.streams, !streams.isEmpty else { return nil }
-        return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
     }
 
     /// One ranged read of the chosen next-episode source shortly before the
