@@ -1355,9 +1355,9 @@ struct TVPlayerView: View {
         addonSubsKey = key
         addonSubs = []
         addedSubURLs = []
-        let addons = account.addons
+        let sources = SubtitleAddonService.sources(core: core.addons, account: account.addons)
         Task { @MainActor in
-            let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: m.videoId)
+            let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: m.videoId)
             guard addonSubsKey == key else { return }   // episode changed mid-fetch
             addonSubs = subs
             if showOptions, panelKind == .subtitles { panelRows = optionRows }
